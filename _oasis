@@ -1,0 +1,23 @@
+Name: OverleafSlackBot
+Version: 0.1
+Synopsis: A Slack bot for Overleaf.
+Authors: Tomas Tauber <tomtau@hku.hk>
+License: MIT
+
+Description: OverleafSlackBot sends notifications to selected Slack channels about new changes in Overleaf projects.
+Homepage: https://github.com/tomtau/overleafslack
+
+OASISFormat: 0.4
+BuildTools: ocamlbuild
+Plugins: META (0.4), DevFiles (0.4)
+
+Executable "olsbot"
+  Path: src
+  MainIs: botmain.ml
+  BuildDepends: lwt, git, git.unix, cmdliner
+
+SourceRepository master
+  Type: git
+  Location: https://github.com/tomtau/overleafslack.git
+  Branch: master
+  Browser: https://github.com/tomtau/overleafslack
