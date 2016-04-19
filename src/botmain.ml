@@ -22,14 +22,6 @@ let mk_flag ?section flags doc =
   let doc = Arg.info ?docs:section ~doc flags in
   Arg.(value & flag & doc)
 
-let backend =
-  let memory = mk_flag ["m";"in-memory"] "Use an in-memory store." in
-  let create = function
-    | true  -> (module Memory: Store.S)
-    | false -> (module FS    : Store.S)
-  in
-  Term.(pure create $ memory)
-
 (* Global options *)
 type global = {
   verbose: bool;
@@ -108,6 +100,11 @@ let channel =
       ~doc:"Slack Channel to Post Notifications to." [] in
   Arg.(required & pos 2 (some string) None & doc)
 
+let checktime =
+  let doc = Arg.info ~docv:"CHECKTIME"
+      ~doc:"Time period (in seconds) for checking the repository." [] in
+  Arg.(required & pos 3 (some int) None & doc)
+
 let run t =
   Lwt_unix.run (
     Lwt.catch
@@ -120,9 +117,9 @@ let mk (fn:'a): 'a Term.t =
 
 module ExtractedCommit = struct
   type t = {
-      message: string;
-      author: string;
-      sha1: Git.SHA.Commit.t;
+    message: string;
+    author: string;
+    sha1: Git.SHA.Commit.t;
   }
   let message t = t.message
   let author t = t.author
@@ -135,15 +132,15 @@ module ExtractedCommit = struct
   module StringSet = Set.Make(String)
 
   module Set = Set.Make(struct type commit = t
-                               type t = commit
-                               let compare = compare
+      type t = commit
+      let compare = compare
     end)
   let of_git sha1 c =
     let a = Git.Commit.(c.author) in
     let message = Git.Commit.(c.message) in
     let author = Git.User.(a.name) in
     { message; author; sha1 }      
-  
+
 end  
 
 open ExtractedCommit
@@ -154,19 +151,17 @@ let payload channel username text icon_emoji = "{\"channel\": \""^ channel ^"\",
 let query_lwt api_url bodypayload =
   Cohttp_lwt_unix.Client.post (Uri.of_string api_url) ~body:bodypayload
   >|= snd
-    >>= Cohttp_lwt_body.to_string
+  >>= Cohttp_lwt_body.to_string
 
-(* post to channel *)
-let channel_post = {
-  name = "channel_post";
-  doc  = "Fetches a remote Git repository and posts its commit messages to a Slack channel.";
-  man  = [];
-  term =
-    let channel_post (module S: Store.S) remote hookurl channel =
-      let module Sy = Sync.Make(S) in
-      run begin
-        S.create ()   >>= fun t ->
-        S.read_head t >>= fun head ->
+let fetch_commits (module S: Store.S) rem =
+  let module Sy = Sync.Make(S) in
+  S.create ()   >>= fun t ->
+  Sy.fetch ~update:true t rem >>= fun c -> 
+  (match Sync.Result.head_contents c with
+   | Some h -> S.write_head t h
+   | None   -> Lwt.return_unit)
+  >>= fun _ -> 
+  S.read_head t >>= fun head ->
   (match head with
    | Some (Git.Reference.SHA sha) -> return sha
    | Some (Git.Reference.Ref r) -> S.read_reference_exn t r
@@ -194,13 +189,29 @@ let channel_post = {
     Lwt_list.fold_left_s add_parent sd Git.Commit.(commit.parents)
   in
   get_parent_commits t commit (s, dealt) >>= fun coms ->
+  Lwt.return (fst coms)
 
-      ExtractedCommit.Set.iter (fun x ->
-          let _ = run(query_lwt hookurl (Cohttp_lwt_body.of_string (payload channel "overleafbot" (x.author ^ ": " ^ x.message) ":writing_hand:"))) in ()) (fst coms);
-            Lwt.return_unit
-      end
-    in      
-    Term.(mk channel_post $ backend $ remote $ hookurl $ channel)
+(* TODO: (re-)use Store instead of creating from fresh and passing the set *)
+let rec channel_post_loop remote hookurl channel wtime s =
+  Lwt_unix.sleep wtime >>= fun () -> let new_s = run (fetch_commits (module Memory: Store.S) remote) in
+  let diff_set = ExtractedCommit.Set.diff new_s s in
+  Format.printf "new commits: %d@." (ExtractedCommit.Set.cardinal diff_set);
+  ExtractedCommit.Set.iter (fun x -> Format.printf "%s@." x.message) new_s; 
+  ExtractedCommit.Set.iter (fun x ->
+      let _ = run(query_lwt hookurl (Cohttp_lwt_body.of_string (payload channel "overleafbot" (x.author ^ ": " ^ x.message) ":writing_hand:"))) in ()) diff_set;
+  channel_post_loop remote hookurl channel wtime new_s
+
+(* post to channel *)
+let channel_post = {
+  name = "channel_post";
+  doc  = "Fetches a remote Git repository and posts its commit messages to a Slack channel.";
+  man  = [];
+  term = let exec remote hookurl channel checktime =
+           let initial = run (fetch_commits (module Memory: Store.S) remote) in
+           let _ = channel_post_loop remote hookurl channel (float_of_int checktime) initial in
+           Lwt_unix.run (fst(Lwt.wait ()))
+    in
+    Term.(mk exec $ remote $ hookurl $ channel $ checktime)
 }
 
 let default =
@@ -220,7 +231,7 @@ let default =
       \    channel_post       %s\n\
        \n\
        See 'olsbot help <command>' for more information on a specific command.\n%!"
-       channel_post.doc in
+      channel_post.doc in
   Term.(pure usage $ (pure ())),
   Term.info "olsbot"
     ~version:Version.current
@@ -228,7 +239,8 @@ let default =
     ~doc
     ~man
 
-let () = 
+let () =
   match Term.eval_choice default [command channel_post] with
   | `Error _ -> exit 1
-  | _ -> ()
+  | _ -> ();
+
